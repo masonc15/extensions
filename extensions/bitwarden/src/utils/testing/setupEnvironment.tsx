@@ -46,6 +46,7 @@ jest.mock(
         windowActionOnCopy: "close",
         primaryAction: "copy",
         syncOnLaunch: true,
+        serveDaemon: true,
       })
     ),
     LocalStorage: {
