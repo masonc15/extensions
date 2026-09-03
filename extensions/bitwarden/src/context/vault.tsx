@@ -130,7 +130,10 @@ export function VaultProvider(props: VaultProviderProps) {
   function applyVault(items: Item[], folders: Folder[]) {
     setState({ items, folders });
     publishItems(items);
-    cacheVault(items, folders);
+    // Deferred past first paint: stringify+encrypt of a 2k-item vault costs
+    // ~20MB of transient heap, which used to peak together with render. The
+    // write is side-effect-only, so no unmount guard is needed.
+    setTimeout(() => cacheVault(items, folders), 1500);
   }
 
   /**

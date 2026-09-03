@@ -9,7 +9,6 @@ import { SessionProvider } from "~/context/session";
 import { useVaultContext, VaultProvider } from "~/context/vault";
 import { Folder, Item } from "~/types/vault";
 import { VaultLoadingFallback } from "~/components/searchVault/VaultLoadingFallback";
-import { useVaultSearch } from "./utils/search";
 import { VaultActionsSection } from "~/components/actions";
 
 const SearchVaultCommand = () => (
@@ -30,16 +29,18 @@ const SearchVaultCommand = () => (
 
 function SearchVaultComponent() {
   const { items, folders, isLoading, isEmpty } = useVaultContext();
-  const { setSearchText, filteredItems } = useVaultSearch(items);
-  const { favoriteItems, nonFavoriteItems } = useSeparateFavoriteItems(filteredItems);
+  // Native filtering (with per-row keywords) instead of the fast-fuzzy index:
+  // the index cost ~30MB of worker heap for a 2k-item vault and was rebuilt on
+  // every render, which OOMed the 100MB extension worker. Keystrokes now
+  // filter natively with zero React re-renders. Tradeoff: no typo tolerance.
+  const { favoriteItems, nonFavoriteItems } = useSeparateFavoriteItems(items);
 
   return (
     <List
       searchBarPlaceholder="Search vault"
-      filtering={false}
+      filtering
       isLoading={isLoading}
       searchBarAccessory={<ListFolderDropdown />}
-      onSearchTextChange={setSearchText}
     >
       {favoriteItems.length > 0 ? (
         <>
