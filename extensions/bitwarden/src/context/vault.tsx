@@ -1,6 +1,7 @@
 import { getPreferenceValues, showToast, Toast } from "@raycast/api";
-import { createContext, ReactNode, useContext, useMemo, useReducer } from "react";
+import { createContext, ReactNode, useContext, useEffect, useMemo, useReducer, useRef } from "react";
 import { useVaultItemPublisher } from "~/components/searchVault/context/vaultListeners";
+import { cacheFolders, getCachedFolders } from "~/components/searchVault/utils/folderCache";
 import { useBitwarden } from "~/context/bitwarden";
 import { useSession } from "~/context/session";
 import { Folder, Item, Vault } from "~/types/vault";
@@ -50,13 +51,29 @@ export function VaultProvider(props: VaultProviderProps) {
     { ...getInitialState(), ...getCachedVault() }
   );
 
+  // Guards fire-and-forget background work (sync/refresh) against setting state after unmount.
+  const mountedRef = useRef(true);
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+    },
+    []
+  );
+
   useOnceEffect(() => {
-    if (syncOnLaunch) {
-      void syncItems({ isInitial: true });
-    } else {
-      void loadItems();
-    }
+    void initialLoad();
   }, session.active && session.token);
+
+  /**
+   * Launch path: load from the local vault first so the list (with real,
+   * copyable passwords) is usable immediately, then sync in the background.
+   * Previously this awaited `bw sync` before loading anything, blocking every
+   * copy on a network round-trip plus a full vault re-decrypt.
+   */
+  async function initialLoad() {
+    await loadItems();
+    if (syncOnLaunch) void syncInBackground();
+  }
 
   async function loadItems(options?: { suppressErrorToast?: boolean }) {
     try {
@@ -65,11 +82,24 @@ export function VaultProvider(props: VaultProviderProps) {
       let items: Item[] = [];
       let folders: Folder[] = [];
       try {
-        const [itemsResult, foldersResult] = await Promise.all([bitwarden.listItems(), bitwarden.listFolders()]);
+        // Folders rarely change: a fresh LocalStorage cache skips the
+        // `bw list folders` spawn (~1.5s) entirely.
+        const cachedFolders = await getCachedFolders();
+        const [itemsResult, foldersResult] = await Promise.all([
+          bitwarden.listItems(),
+          cachedFolders ? Promise.resolve(null) : bitwarden.listFolders(),
+        ]);
         if (itemsResult.error) throw itemsResult.error;
-        if (foldersResult.error) throw foldersResult.error;
         items = itemsResult.result;
-        folders = foldersResult.result;
+        if (foldersResult) {
+          if (foldersResult.error) throw foldersResult.error;
+          folders = foldersResult.result;
+          void cacheFolders(folders);
+        } else {
+          folders = cachedFolders ?? [];
+          // Refresh the folder list without blocking the UI.
+          void refreshFoldersInBackground();
+        }
         items.sort(favoriteItemsFirstSorter);
       } catch (error) {
         publishItems(new FailedToLoadVaultItemsError());
@@ -89,12 +119,22 @@ export function VaultProvider(props: VaultProviderProps) {
     }
   }
 
-  async function syncItems(props?: { isInitial?: boolean }) {
-    const { isInitial = false } = props ?? {};
+  async function refreshFoldersInBackground() {
+    try {
+      const { error, result } = await bitwarden.listFolders();
+      if (error) throw error;
+      if (!mountedRef.current) return;
+      setState({ folders: result });
+      void cacheFolders(result);
+    } catch (error) {
+      captureException("Failed to refresh folders", error);
+    }
+  }
 
+  /** Manual sync action (⌥R): blocking, with progress toast. */
+  async function syncItems() {
     const toast = await showToast({
       title: "Syncing vault...",
-      message: isInitial ? "Background task" : undefined,
       style: Toast.Style.Animated,
     });
     try {
@@ -106,6 +146,35 @@ export function VaultProvider(props: VaultProviderProps) {
       }
       await loadItems({ suppressErrorToast: !!error });
       if (!error) await toast.hide();
+    } catch (error) {
+      await bitwarden.logout();
+      toast.style = Toast.Style.Failure;
+      toast.title = "Failed to sync vault";
+      toast.message = getDisplayableErrorMessage(error);
+    }
+  }
+
+  /** Launch-time sync: never blocks the UI; failures surface as a toast. */
+  async function syncInBackground() {
+    const toast = await showToast({
+      title: "Syncing vault...",
+      message: "Background task",
+      style: Toast.Style.Animated,
+    });
+    try {
+      const { error } = await bitwarden.sync();
+      if (error) {
+        toast.style = Toast.Style.Failure;
+        toast.title = "Failed to sync vault";
+        toast.message = getDisplayableErrorMessage(error);
+        return;
+      }
+      if (!mountedRef.current) {
+        await toast.hide();
+        return;
+      }
+      await loadItems({ suppressErrorToast: true });
+      await toast.hide();
     } catch (error) {
       await bitwarden.logout();
       toast.style = Toast.Style.Failure;

@@ -17,6 +17,8 @@ export const LOCAL_STORAGE_KEY = {
   VAULT_LOCK_REASON: "vaultLockReason",
   VAULT_FAVORITE_ORDER: "vaultFavoriteOrder",
   VAULT_LAST_STATUS: "lastVaultStatus",
+  CACHED_FOLDERS: "cachedFolders",
+  CACHED_FOLDERS_TIME: "cachedFoldersTime",
 } as const;
 
 export const VAULT_LOCK_MESSAGES = {
@@ -79,7 +81,14 @@ export const CACHE_KEYS = {
   CURRENT_FOLDER_ID: "currentFolderId",
   SEND_TYPE_FILTER: "sendTypeFilter",
   CLI_VERSION: "cliVersion",
+  CLI_VERSION_TIME: "cliVersionTime",
 } as const;
+
+/** How long cached folders are trusted before a fresh `bw list folders` spawn. Folders rarely change. */
+export const FOLDER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** How often to re-run `bw --version` (a ~0.5s spawn) to refresh the cached CLI version. */
+export const CLI_VERSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 export const ITEM_TYPE_TO_ICON_MAP: Record<ItemType, Icon> = {
   [ItemType.LOGIN]: Icon.Globe,

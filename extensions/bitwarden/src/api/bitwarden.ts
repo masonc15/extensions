@@ -1,7 +1,7 @@
 import { environment, getPreferenceValues, LocalStorage, open, showToast, Toast } from "@raycast/api";
 import { execa, ExecaChildProcess, ExecaError, ExecaReturnValue } from "execa";
 import { existsSync, unlinkSync, writeFileSync, accessSync, constants, chmodSync } from "fs";
-import { LOCAL_STORAGE_KEY, DEFAULT_SERVER_URL, CACHE_KEYS } from "~/constants/general";
+import { LOCAL_STORAGE_KEY, DEFAULT_SERVER_URL, CACHE_KEYS, CLI_VERSION_TTL_MS } from "~/constants/general";
 import { VaultState, VaultStatus } from "~/types/general";
 import { PasswordGeneratorOptions } from "~/types/passwords";
 import { Folder, Item, ItemType, Login } from "~/types/vault";
@@ -241,8 +241,15 @@ export class Bitwarden {
 
   private async retrieveAndCacheCliVersion(): Promise<void> {
     try {
+      // `bw --version` costs a ~0.5s spawn on every launch; the version only
+      // matters for troubleshooting output, so refresh it at most daily.
+      const lastChecked = Cache.get(CACHE_KEYS.CLI_VERSION_TIME);
+      if (lastChecked && Date.now() - Number(lastChecked) < CLI_VERSION_TTL_MS) return;
       const { error, result } = await this.getVersion();
-      if (!error) Cache.set(CACHE_KEYS.CLI_VERSION, result);
+      if (!error) {
+        Cache.set(CACHE_KEYS.CLI_VERSION, result);
+        Cache.set(CACHE_KEYS.CLI_VERSION_TIME, String(Date.now()));
+      }
     } catch (error) {
       captureException("Failed to retrieve and cache cli version", error, { captureToRaycast: true });
     }
