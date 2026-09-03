@@ -2,6 +2,7 @@ import { environment, getPreferenceValues, LocalStorage, open, showToast, Toast 
 import { execa, ExecaChildProcess, ExecaError, ExecaReturnValue } from "execa";
 import { existsSync, unlinkSync, writeFileSync, accessSync, constants, chmodSync } from "fs";
 import { LOCAL_STORAGE_KEY, DEFAULT_SERVER_URL, CACHE_KEYS, CLI_VERSION_TTL_MS } from "~/constants/general";
+import { ServeApiError, ServeDaemon, unwrapServeList, unwrapServeObject, unwrapServeTotp } from "~/api/serve";
 import { VaultState, VaultStatus } from "~/types/general";
 import { PasswordGeneratorOptions } from "~/types/passwords";
 import { Folder, Item, ItemType, Login } from "~/types/vault";
@@ -148,6 +149,9 @@ export class Bitwarden {
   private cliPath: string;
   private toastInstance: Toast | undefined;
   wasCliUpdated = false;
+  private serveDaemon: ServeDaemon | null = null;
+  private serveStarting: Promise<ServeDaemon | null> | null = null;
+  private serveGeneration = 0;
 
   constructor(toastInstance?: Toast) {
     const { cliPath: cliPathPreference, clientId, clientSecret, serverCertsPath } = this.preferences;
@@ -355,6 +359,89 @@ export class Bitwarden {
     return result;
   }
 
+  private serveEnabled(): boolean {
+    // A one-off session token (reprompt flows) must keep using the CLI so the
+    // daemon's session is never bypassed.
+    return this.preferences.serveDaemon !== false && !this.tempSessionToken && !!this.env.BW_SESSION;
+  }
+
+  private getServeDaemon(): Promise<ServeDaemon | null> {
+    if (!this.serveEnabled()) return Promise.resolve(null);
+    if (this.serveDaemon) return Promise.resolve(this.serveDaemon);
+    if (!this.serveStarting) {
+      const generation = this.serveGeneration;
+      const env = this.env;
+      const flight = (this.serveStarting = ServeDaemon.ensure({
+        cliPath: this.cliPath,
+        env,
+        supportPath,
+      })
+        .then((daemon) => {
+          if (generation === this.serveGeneration) {
+            this.serveDaemon = daemon;
+            return daemon;
+          }
+          // Locked/logged out while starting: shut the late daemon down.
+          void daemon.stop();
+          return null;
+        })
+        .catch(() => null)
+        .finally(() => {
+          if (this.serveStarting === flight) this.serveStarting = null;
+        }));
+    }
+    return this.serveStarting;
+  }
+
+  private async stopServeDaemon(): Promise<void> {
+    this.serveGeneration++;
+    const daemon = this.serveDaemon;
+    this.serveDaemon = null;
+    if (daemon) await daemon.stop();
+  }
+
+  /**
+   * Fast path for vault reads via the local API server. Returns `{result}` /
+   * `{error}` when serve handled the call, or `null` when the caller should
+   * fall back to the CLI (daemon unavailable, or an unmapped vault error where
+   * the CLI produces the authoritative error).
+   */
+  private async viaServe<T>(
+    method: "GET" | "POST",
+    path: string,
+    unwrap: (json: unknown) => T,
+    resetVaultTimeout: boolean
+  ): Promise<MaybeError<T> | null> {
+    const daemon = await this.getServeDaemon();
+    if (!daemon) return null;
+    try {
+      const json = method === "GET" ? await daemon.get(path) : await daemon.post(path);
+      if (resetVaultTimeout) {
+        await LocalStorage.setItem(LOCAL_STORAGE_KEY.LAST_ACTIVITY_TIME, new Date().toISOString());
+      }
+      return { result: unwrap(json) };
+    } catch (error) {
+      return this.handleServeError(error);
+    }
+  }
+
+  private async handleServeError<T>(error: unknown): Promise<MaybeError<T> | null> {
+    if (error instanceof ServeApiError) {
+      if (/vault is locked/i.test(error.message)) {
+        await this.lock();
+        return { error: new VaultIsLockedError() };
+      }
+      if (/not logged in/i.test(error.message)) {
+        await this.handlePostLogout("Not logged in");
+        return { error: new NotLoggedInError("Not logged in") };
+      }
+      return null;
+    }
+    // Transport failure: drop the daemon so the next call respawns it.
+    this.serveDaemon = null;
+    return null;
+  }
+
   async getVersion(): Promise<MaybeError<string>> {
     try {
       const { stdout: result } = await this.exec(["--version"], { resetVaultTimeout: false });
@@ -386,6 +473,7 @@ export class Bitwarden {
     try {
       if (immediate) await this.handlePostLogout(reason);
 
+      await this.stopServeDaemon();
       await this.exec(["logout"], { resetVaultTimeout: false });
       await this.saveLastVaultStatus("logout", "unauthenticated");
       if (!immediate) await this.handlePostLogout(reason);
@@ -408,6 +496,7 @@ export class Bitwarden {
         if (result.status === "unauthenticated") return { error: new NotLoggedInError("Not logged in") };
       }
 
+      await this.stopServeDaemon();
       await this.exec(["lock"], { resetVaultTimeout: false });
       this.clearSessionToken();
       await this.saveLastVaultStatus("lock", "locked");
@@ -435,6 +524,8 @@ export class Bitwarden {
       this.setSessionToken(sessionToken);
       await this.saveLastVaultStatus("unlock", "unlocked");
       await this.callActionListeners("unlock", password, sessionToken);
+      // Warm the local API server in the background; reads use it once ready.
+      void this.getServeDaemon();
 
       return { result: sessionToken };
     } catch (execError) {
@@ -446,6 +537,8 @@ export class Bitwarden {
   }
 
   async sync(): Promise<MaybeError> {
+    const served = await this.viaServe("POST", "/sync", () => undefined, true);
+    if (served) return served;
     try {
       await this.exec(["sync"], { resetVaultTimeout: true });
       return { result: undefined };
@@ -458,6 +551,8 @@ export class Bitwarden {
   }
 
   async getItem(id: string): Promise<MaybeError<Item>> {
+    const served = await this.viaServe("GET", `/object/item/${encodeURIComponent(id)}`, unwrapServeObject<Item>, true);
+    if (served) return served;
     try {
       const { stdout } = await this.exec(["get", "item", id], { resetVaultTimeout: true });
       return { result: JSON.parse<Item>(stdout) };
@@ -470,6 +565,12 @@ export class Bitwarden {
   }
 
   async listItems(): Promise<MaybeError<Item[]>> {
+    const served = await this.viaServe("GET", "/list/object/items", unwrapServeList<Item>, true);
+    if (served) {
+      if (served.error) return served;
+      // Filter out items without a name property (they are not displayed in the bitwarden app)
+      return { result: served.result.filter((item: Item) => !!item.name) };
+    }
     try {
       const { stdout } = await this.exec(["list", "items"], { resetVaultTimeout: true });
       const items = JSON.parse<Item[]>(stdout);
@@ -520,6 +621,8 @@ export class Bitwarden {
   }
 
   async listFolders(): Promise<MaybeError<Folder[]>> {
+    const served = await this.viaServe("GET", "/list/object/folders", unwrapServeList<Folder>, true);
+    if (served) return served;
     try {
       const { stdout } = await this.exec(["list", "folders"], { resetVaultTimeout: true });
       return { result: JSON.parse<Folder[]>(stdout) };
@@ -551,6 +654,8 @@ export class Bitwarden {
   }
 
   async getTotp(id: string): Promise<MaybeError<string>> {
+    const served = await this.viaServe("GET", `/object/totp/${encodeURIComponent(id)}`, unwrapServeTotp, true);
+    if (served) return served;
     try {
       // this could return something like "Not found." but checks for totp code are done before calling this function
       const { stdout } = await this.exec(["get", "totp", id], { resetVaultTimeout: true });
@@ -564,6 +669,8 @@ export class Bitwarden {
   }
 
   async status(): Promise<MaybeError<VaultState>> {
+    const served = await this.viaServe("GET", "/status", unwrapServeObject<VaultState>, false);
+    if (served) return served;
     try {
       const { stdout } = await this.exec(["status"], { resetVaultTimeout: false });
       return { result: JSON.parse<VaultState>(stdout) };

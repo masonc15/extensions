@@ -424,6 +424,15 @@
       "title": "Performance",
       "label": "Enable Caching",
       "description": "Whether to cache vault items for faster load times. This will NOT cache the actual passwords and other sensitive values, only usernames/emails and other non-sensitive labels."
+    },
+    {
+      "name": "serveDaemon",
+      "type": "checkbox",
+      "required": false,
+      "default": true,
+      "title": "Performance",
+      "label": "Use Local API Server",
+      "description": "Keep a Bitwarden API server (bw serve on localhost) running while unlocked so vault reads skip the CLI startup cost. The server is stopped on lock/logout. Falls back to the CLI automatically when unavailable."
     }
   ],
   "dependencies": {
