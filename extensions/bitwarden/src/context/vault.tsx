@@ -2,6 +2,7 @@ import { getPreferenceValues, showToast, Toast } from "@raycast/api";
 import { createContext, ReactNode, useContext, useEffect, useMemo, useReducer, useRef } from "react";
 import { useVaultItemPublisher } from "~/components/searchVault/context/vaultListeners";
 import { cacheFolders, getCachedFolders } from "~/components/searchVault/utils/folderCache";
+import { getVaultSignature } from "~/components/searchVault/utils/vaultSignature";
 import { useBitwarden } from "~/context/bitwarden";
 import { useSession } from "~/context/session";
 import { Folder, Item, Vault } from "~/types/vault";
@@ -60,6 +61,10 @@ export function VaultProvider(props: VaultProviderProps) {
     []
   );
 
+  // Latest state for async callbacks (change-detection compares against this).
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
   useOnceEffect(() => {
     void initialLoad();
   }, session.active && session.token);
@@ -78,37 +83,8 @@ export function VaultProvider(props: VaultProviderProps) {
   async function loadItems(options?: { suppressErrorToast?: boolean }) {
     try {
       setState({ isLoading: true });
-
-      let items: Item[] = [];
-      let folders: Folder[] = [];
-      try {
-        // Folders rarely change: a fresh LocalStorage cache skips the
-        // `bw list folders` spawn (~1.5s) entirely.
-        const cachedFolders = await getCachedFolders();
-        const [itemsResult, foldersResult] = await Promise.all([
-          bitwarden.listItems(),
-          cachedFolders ? Promise.resolve(null) : bitwarden.listFolders(),
-        ]);
-        if (itemsResult.error) throw itemsResult.error;
-        items = itemsResult.result;
-        if (foldersResult) {
-          if (foldersResult.error) throw foldersResult.error;
-          folders = foldersResult.result;
-          void cacheFolders(folders);
-        } else {
-          folders = cachedFolders ?? [];
-          // Refresh the folder list without blocking the UI.
-          void refreshFoldersInBackground();
-        }
-        items.sort(favoriteItemsFirstSorter);
-      } catch (error) {
-        publishItems(new FailedToLoadVaultItemsError());
-        throw error;
-      }
-
-      setState({ items, folders });
-      publishItems(items);
-      cacheVault(items, folders);
+      const { items, folders } = await fetchVault();
+      applyVault(items, folders);
     } catch (error) {
       if (!options?.suppressErrorToast) {
         await showToast(Toast.Style.Failure, "Failed to load vault items", getDisplayableErrorMessage(error));
@@ -116,6 +92,62 @@ export function VaultProvider(props: VaultProviderProps) {
       captureException("Failed to load vault items", error);
     } finally {
       setState({ isLoading: false });
+    }
+  }
+
+  /** Reads items + folders from the local vault (one `bw list items` spawn, folders cached). */
+  async function fetchVault(): Promise<Vault> {
+    let items: Item[] = [];
+    let folders: Folder[] = [];
+    try {
+      // Folders rarely change: a fresh LocalStorage cache skips the
+      // `bw list folders` spawn (~1.5s) entirely.
+      const cachedFolders = await getCachedFolders();
+      const [itemsResult, foldersResult] = await Promise.all([
+        bitwarden.listItems(),
+        cachedFolders ? Promise.resolve(null) : bitwarden.listFolders(),
+      ]);
+      if (itemsResult.error) throw itemsResult.error;
+      items = itemsResult.result;
+      if (foldersResult) {
+        if (foldersResult.error) throw foldersResult.error;
+        folders = foldersResult.result;
+        void cacheFolders(folders);
+      } else {
+        folders = cachedFolders ?? [];
+        // Refresh the folder list without blocking the UI.
+        void refreshFoldersInBackground();
+      }
+      items.sort(favoriteItemsFirstSorter);
+    } catch (error) {
+      publishItems(new FailedToLoadVaultItemsError());
+      throw error;
+    }
+    return { items, folders };
+  }
+
+  /** Publishes a fetched vault to state, subscribers and the encrypted cache. */
+  function applyVault(items: Item[], folders: Folder[]) {
+    setState({ items, folders });
+    publishItems(items);
+    cacheVault(items, folders);
+  }
+
+  /**
+   * Silent background refresh after `bw sync`. When the sync pulled no
+   * changes, applying a second full vault would briefly double heap usage
+   * (old state + new parse + new search index) for no benefit, so identical
+   * snapshots are skipped. Never touches isLoading and never toasts.
+   */
+  async function reloadItemsIfChanged() {
+    try {
+      const { items, folders } = await fetchVault();
+      const current = stateRef.current;
+      if (getVaultSignature(items, folders) === getVaultSignature(current.items, current.folders)) return;
+      if (!mountedRef.current) return;
+      applyVault(items, folders);
+    } catch (error) {
+      captureException("Failed to reload vault items", error);
     }
   }
 
@@ -173,7 +205,7 @@ export function VaultProvider(props: VaultProviderProps) {
         await toast.hide();
         return;
       }
-      await loadItems({ suppressErrorToast: true });
+      await reloadItemsIfChanged();
       await toast.hide();
     } catch (error) {
       await bitwarden.logout();
@@ -193,10 +225,16 @@ export function VaultProvider(props: VaultProviderProps) {
     cacheVault(newState.items, newState.folders);
   }
 
+  // Memoized so the fuzzy-search index downstream isn't rebuilt on every render.
+  const visibleItems = useMemo(
+    () => filterItemsByFolderId(state.items, currentFolderId),
+    [state.items, currentFolderId]
+  );
+
   const memoizedValue: VaultContextType = useMemo(
     () => ({
       ...state,
-      items: filterItemsByFolderId(state.items, currentFolderId),
+      items: visibleItems,
       isEmpty: state.items.length == 0,
       isLoading: state.isLoading || session.isLoading,
       currentFolderId,
@@ -205,7 +243,7 @@ export function VaultProvider(props: VaultProviderProps) {
       setCurrentFolder,
       updateState,
     }),
-    [state, session.isLoading, currentFolderId, syncItems, loadItems, setCurrentFolder, updateState]
+    [state, visibleItems, session.isLoading, currentFolderId, syncItems, loadItems, setCurrentFolder, updateState]
   );
 
   return <VaultContext.Provider value={memoizedValue}>{children}</VaultContext.Provider>;
